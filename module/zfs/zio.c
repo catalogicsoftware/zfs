@@ -894,6 +894,8 @@ zio_write_override(zio_t *zio, blkptr_t *bp, int copies, boolean_t nopwrite)
 void
 zio_free(spa_t *spa, uint64_t txg, const blkptr_t *bp)
 {
+	const dva_t *dva = bp->blk_dva;
+	int ndvas = BP_GET_NDVAS(bp);
 
 	/*
 	 * The check for EMBEDDED is a performance optimization.  We
@@ -915,6 +917,13 @@ zio_free(spa_t *spa, uint64_t txg, const blkptr_t *bp)
 	    spa_sync_pass(spa) >= zfs_sync_pass_deferred_free) {
 		bplist_append(&spa->spa_free_bplist[txg & TXG_MASK], bp);
 	} else {
+		for (int i = 0; i < ndvas; i++) {
+			zfs_dbgmsg("zio_free: [%s] %llu:%llx:%llx\n",
+				   spa->spa_name,
+				   (u_longlong_t)DVA_GET_VDEV(&dva[i]),
+				   (u_longlong_t)DVA_GET_OFFSET(&dva[i]),
+				   (u_longlong_t)DVA_GET_ASIZE(&dva[i]));
+		}
 		VERIFY0(zio_wait(zio_free_sync(NULL, spa, txg, bp, 0)));
 	}
 }
