@@ -33,6 +33,7 @@
 #include <stdio_ext.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <math.h>
 #include <sys/zfs_context.h>
 #include <sys/spa.h>
 #include <sys/spa_impl.h>
@@ -102,6 +103,10 @@ uint64_t *zopt_object = NULL;
 int zopt_objects = 0;
 libzfs_handle_t *g_zfs;
 uint64_t max_inflight = 1000;
+const uint64_t vdev_label_size = 0x400000;
+const uint64_t block_size = 4096;
+const uint64_t shift = (uint64_t)(log10(4096) / log10(2));
+const double partition_offset = 0x800000 / 4096;
 
 static void snprintf_blkptr_compact(char *, size_t, const blkptr_t *);
 
@@ -756,6 +761,34 @@ dump_spacemap(objset_t *os, space_map_t *sm)
 }
 
 static void
+dump_offset(objset_t *os, space_map_t *sm, FILE *blockmap_file)
+{
+	uint64_t offset, entry;
+
+	if (sm == NULL)
+		return;
+
+	for (offset = 0; offset < space_map_length(sm);
+	    offset += sizeof (entry)) {
+		uint8_t mapshift = sm->sm_shift;
+
+		VERIFY0(dmu_read(os, space_map_object(sm), offset,
+		    sizeof (entry), &entry, DMU_READ_PREFETCH));
+
+		if (!SM_DEBUG_DECODE(entry) && SM_TYPE_DECODE(entry) != SM_ALLOC) {
+			char buf[32];
+			sprintf(buf, "%llu: %llu\n", 
+				(longlong_t)(((((SM_OFFSET_DECODE(entry) << 
+				mapshift) + sm->sm_start) + vdev_label_size) >> 
+				shift) + partition_offset + 1), 
+				(longlong_t)((SM_RUN_DECODE(entry) << 
+				mapshift) / block_size));
+			fwrite(buf , 1, sizeof(buf), blockmap_file);
+		}
+	}
+}
+
+static void
 dump_metaslab_stats(metaslab_t *msp)
 {
 	char maxbuf[32];
@@ -770,6 +803,22 @@ dump_metaslab_stats(metaslab_t *msp)
 	    "freepct", free_pct);
 	(void) printf("\tIn-memory histogram:\n");
 	dump_histogram(rt->rt_histogram, RANGE_TREE_HISTOGRAM_SIZE, 0);
+}
+
+static void
+dump_offsets(metaslab_t *msp, FILE *blockmap_file)
+{
+	vdev_t *vd = msp->ms_group->mg_vd;
+	spa_t *spa = vd->vdev_spa;
+
+	if (dump_opt['d'] > 5 || dump_opt['m'] > 3) {
+		ASSERT(msp->ms_size == (1ULL << vd->vdev_ms_shift));
+
+		mutex_enter(&msp->ms_lock);
+		dump_offset(spa->spa_meta_objset, msp->ms_sm,
+			blockmap_file);
+		mutex_exit(&msp->ms_lock);
+	}
 }
 
 static void
@@ -872,6 +921,43 @@ dump_metaslab_groups(spa_t *spa)
 	else
 		(void) printf("\t%3llu%%\n", (u_longlong_t)fragmentation);
 	dump_histogram(mc->mc_histogram, RANGE_TREE_HISTOGRAM_SIZE, 0);
+}
+
+static void
+dump_blockmap(spa_t *spa, char *blockmap_file_path)
+{
+	vdev_t *vd, *rvd = spa->spa_root_vdev;
+	uint64_t m, c = 0, children = rvd->vdev_children;
+	FILE *blockmap_file = fopen(blockmap_file_path, "wb");
+
+	if (!dump_opt['d'] && zopt_objects > 0) {
+		c = zopt_object[0];
+
+		if (c >= children)
+			(void) fatal("bad vdev id: %llu", (u_longlong_t)c);
+
+		if (zopt_objects > 1) {
+			vd = rvd->vdev_child[c];
+
+			for (m = 1; m < zopt_objects; m++) {
+				if (zopt_object[m] < vd->vdev_ms_count)
+					dump_offsets(
+					    vd->vdev_ms[zopt_object[m]],
+					    blockmap_file);
+			}
+			fclose(blockmap_file);
+			return;
+		}
+		children = c + 1;
+	}
+	for (; c < children; c++) {
+		vd = rvd->vdev_child[c];
+
+		for (m = 0; m < vd->vdev_ms_count; m++)
+			dump_offsets(vd->vdev_ms[m],
+				blockmap_file);
+	}
+	fclose(blockmap_file);
 }
 
 static void
@@ -3660,7 +3746,7 @@ dump_simulated_ddt(spa_t *spa)
 }
 
 static void
-dump_zpool(spa_t *spa)
+dump_zpool(spa_t *spa, char *blockmap_file_path)
 {
 	dsl_pool_t *dp = spa_get_dsl(spa);
 	int rc = 0;
@@ -3684,8 +3770,13 @@ dump_zpool(spa_t *spa)
 	if (dump_opt['D'])
 		dump_all_ddts(spa);
 
-	if (dump_opt['d'] > 2 || dump_opt['m'])
-		dump_metaslabs(spa);
+	if (dump_opt['d'] > 2 || dump_opt['m']){
+		if(blockmap_file_path != NULL){
+			dump_blockmap(spa, blockmap_file_path);
+		} else{
+			dump_metaslabs(spa);
+		}
+	}
 	if (dump_opt['M'])
 		dump_metaslab_groups(spa);
 
@@ -4183,6 +4274,7 @@ main(int argc, char **argv)
 	int flags = ZFS_IMPORT_MISSING_LOG;
 	int rewind = ZPOOL_NEVER_REWIND;
 	char *spa_config_path_env;
+	char *blockmap_file_path = NULL;
 	boolean_t target_is_spa = B_TRUE;
 
 	(void) setrlimit(RLIMIT_NOFILE, &rl);
@@ -4200,7 +4292,7 @@ main(int argc, char **argv)
 		spa_config_path = spa_config_path_env;
 
 	while ((c = getopt(argc, argv,
-	    "AbcCdDeEFGhiI:lLmMo:Op:PqRsSt:uU:vVx:X")) != -1) {
+	    "AbcCdDeEFGhiI:lLmMo:Op:PqRsSt:uU:vVx:XZ:")) != -1) {
 		switch (c) {
 		case 'b':
 		case 'c':
@@ -4286,6 +4378,21 @@ main(int argc, char **argv)
 			break;
 		case 'x':
 			vn_dumpdir = optarg;
+			break;
+		case 'Z':
+			if (optarg != NULL){
+				blockmap_file_path = optarg;
+				if (blockmap_file_path[0] != '/') {
+					(void) fprintf(stderr,
+					    "blockmap file must be saved to an absolute path "
+					    "(i.e. start with a slash)\n");
+					usage();
+				}
+			} else {
+				(void) fprintf(stderr,
+				    "absolute path to save blockmap file required\n");
+				usage();
+			}
 			break;
 		default:
 			usage();
@@ -4489,7 +4596,7 @@ main(int argc, char **argv)
 		} else if (zopt_objects > 0 && !dump_opt['m']) {
 			dump_dir(spa->spa_meta_objset);
 		} else {
-			dump_zpool(spa);
+			dump_zpool(spa, blockmap_file_path);
 		}
 	} else {
 		flagbits['b'] = ZDB_FLAG_PRINT_BLKPTR;
