@@ -24,6 +24,7 @@
  * Copyright (c) 2011 Nexenta Systems, Inc. All rights reserved.
  */
 
+#include <sys/zfs_context.h>
 #include <sys/sysmacros.h>
 #include <sys/zfs_context.h>
 #include <sys/fm/fs/zfs.h>
@@ -896,6 +897,13 @@ zio_free(spa_t *spa, uint64_t txg, const blkptr_t *bp)
 {
 	const dva_t *dva = bp->blk_dva;
 	int ndvas = BP_GET_NDVAS(bp);
+	vnode_t *vp;
+	int oflags = FWRITE | FTRUNC | FCREAT | FOFFMAX;
+	int bufSize = 32;
+	char *buf;
+	char *temp;
+	int err;
+	
 
 	/*
 	 * The check for EMBEDDED is a performance optimization.  We
@@ -917,13 +925,43 @@ zio_free(spa_t *spa, uint64_t txg, const blkptr_t *bp)
 	    spa_sync_pass(spa) >= zfs_sync_pass_deferred_free) {
 		bplist_append(&spa->spa_free_bplist[txg & TXG_MASK], bp);
 	} else {
-		for (int i = 0; i < ndvas; i++) {
-			zfs_dbgmsg("zio_free: [%s] %llu:%llx:%llx\n",
+		buf = kmem_zalloc(bufSize, KM_SLEEP);
+		temp = kmem_zalloc(MAXPATHLEN, KM_SLEEP);
+		(void) snprintf(temp, MAXPATHLEN, "/opt/vsnap-data/%s/%llu_free", spa->spa_name,
+			(u_longlong_t)spa->spa_root_vdev->vdev_id);
+		err = vn_open(temp, 1, oflags, 0644, &vp, CRCREAT, 0);
+		if (err == 0) {
+			for (int i = 0; i < ndvas; i++) {
+				while(snprintf(buf, bufSize, "zio_free: [%s] %llu:%llx:%llx\n",
 				   spa->spa_name,
 				   (u_longlong_t)DVA_GET_VDEV(&dva[i]),
 				   (u_longlong_t)DVA_GET_OFFSET(&dva[i]),
-				   (u_longlong_t)DVA_GET_ASIZE(&dva[i]));
+				   (u_longlong_t)DVA_GET_ASIZE(&dva[i])) >= bufSize){
+				   	kmem_free(buf, bufSize);
+					bufSize *= 2;
+					if(bufSize >= 4096){
+						break;
+					}
+        			buf = kmem_zalloc(bufSize, KM_SLEEP);
+				}
+				err = vn_rdwr(UIO_WRITE, vp, buf, sizeof(buf), 0,
+			    	UIO_SYSSPACE, 0, RLIM64_INFINITY, kcred, NULL);
+				if (err == 0)
+					err = VOP_FSYNC(vp, FSYNC, kcred, NULL);
+				kmem_free(buf, bufSize);
+			}
+			(void) VOP_CLOSE(vp, oflags, 1, 0, kcred, NULL);
+		} else {
+			for (int i = 0; i < ndvas; i++) {
+				zfs_dbgmsg("zio_free: [%s] %llu:%llx:%llx\n", 
+					spa->spa_name, 
+					(u_longlong_t)DVA_GET_VDEV(&dva[i]),
+					(u_longlong_t)DVA_GET_OFFSET(&dva[i]),
+					(u_longlong_t)DVA_GET_ASIZE(&dva[i]));
+			}
 		}
+		kmem_free(buf, bufSize);
+		kmem_free(temp, MAXPATHLEN);
 		VERIFY0(zio_wait(zio_free_sync(NULL, spa, txg, bp, 0)));
 	}
 }
